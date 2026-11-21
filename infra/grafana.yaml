@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: grafana-provision, namespace: releasepilot-demo}
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: pilot
+        type: prometheus
+        url: http://prometheus:9090
+        access: proxy
+        isDefault: true
+  provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: ReleasePilot
+        type: file
+        options: {path: /etc/pilot}
+  releases.json: |
+    {"title":"Release health","uid":"release-health","schemaVersion":39,"time":{"from":"now-15m","to":"now"},"refresh":"5s","panels":[{"id":1,"title":"HTTP 500 ratio by release","type":"timeseries","gridPos":{"x":0,"y":0,"w":12,"h":8},"datasource":{"uid":"pilot","type":"prometheus"},"targets":[{"refId":"A","expr":"sum by(release_id)(rate(demo_requests_total{code=\"500\"}[1m])) / sum by(release_id)(rate(demo_requests_total[1m]))"}]},{"id":2,"title":"P95 latency (seconds)","type":"timeseries","gridPos":{"x":12,"y":0,"w":12,"h":8},"datasource":{"uid":"pilot","type":"prometheus"},"targets":[{"refId":"A","expr":"histogram_quantile(0.95,sum by(le,release_id)(rate(demo_duration_seconds_bucket[1m])))"}]}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: grafana, namespace: releasepilot-demo}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: grafana}}
+  template:
+    metadata: {labels: {app: grafana}}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: grafana
+          image: grafana/grafana:12.1.0
+          env:
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: pilot-config, key: GRAFANA_PASSWORD}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/grafana/provisioning/datasources/datasource.yaml, subPath: datasource.yaml}
+            - {name: config, mountPath: /etc/grafana/provisioning/dashboards/provider.yaml, subPath: provider.yaml}
+            - {name: config, mountPath: /etc/pilot/releases.json, subPath: releases.json}
+      volumes: [{name: config, configMap: {name: grafana-provision}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: grafana, namespace: releasepilot-demo}
+spec:
+  selector: {app: grafana}
+  ports: [{port: 3000}]
