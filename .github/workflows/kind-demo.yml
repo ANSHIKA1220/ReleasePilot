@@ -1,0 +1,43 @@
+name: Verify live rollback
+on:
+  workflow_dispatch:
+    inputs:
+      healthy_run: {description: Successful publish run for healthy mode, required: true, type: string}
+      faulty_run: {description: Successful publish run for errors mode, required: true, type: string}
+permissions:
+  contents: read
+  actions: read
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - uses: helm/kind-action@v1
+        with: {cluster_name: releasepilot}
+      - name: Start control plane and demo workload
+        shell: pwsh
+        env:
+          GITHUB_READ_TOKEN: ${{ github.token }}
+        run: ./scripts/start-kind.ps1
+      - name: Verify the live release and rollback
+        env:
+          HEALTHY_RUN: ${{ inputs.healthy_run }}
+          FAULTY_RUN: ${{ inputs.faulty_run }}
+        run: |
+          set -euo pipefail
+          pip install httpx
+          export PILOT_ADMIN_EMAIL=admin@demo.local PILOT_DEVELOPER_EMAIL=dev@demo.local
+          export PILOT_ADMIN_PASSWORD=$(openssl rand -hex 24) PILOT_DEVELOPER_PASSWORD=$(openssl rand -hex 24)
+          for role in admin developer; do
+            upper=${role^^}
+            mail=PILOT_${upper}_EMAIL
+            pass=PILOT_${upper}_PASSWORD
+            kubectl -n releasepilot-demo exec deployment/pilot-api -- env PILOT_NEW_PASSWORD="${!pass}" python -m pilot.manage "${!mail}" "$role"
+          done
+          kubectl -n releasepilot-demo port-forward svc/pilot-api 8000:8000 > /tmp/pilot-forward.log 2>&1 &
+          trap 'kill $! || true' EXIT
+          curl --retry 15 --retry-all-errors --retry-delay 1 -fsS http://localhost:8000/health/ready
+          python scripts/verify-live.py "$GITHUB_REPOSITORY" "$HEALTHY_RUN" "$FAULTY_RUN"

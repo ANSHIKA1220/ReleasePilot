@@ -1,0 +1,77 @@
+name: Verify and publish demo
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: pilot
+          POSTGRES_PASSWORD: ci-only
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 3s --health-timeout 3s --health-retries 15
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:ci-only@localhost:5432/pilot
+      PILOT_TEST_DATABASE_URL: postgresql+psycopg://postgres:ci-only@localhost:5432/pilot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt ruff
+      - run: ruff check --select E9,F63,F7,F82 pilot demo tests
+      - run: alembic upgrade head
+      - run: python -m unittest discover -s tests -v
+      - name: Verify the operator console in Chromium
+        run: |
+          set -euo pipefail
+          pip install playwright
+          python -m playwright install --with-deps chromium
+          export PILOT_ADMIN_EMAIL=browser@demo.local
+          export PILOT_ADMIN_PASSWORD=$(openssl rand -hex 24)
+          PILOT_NEW_PASSWORD="$PILOT_ADMIN_PASSWORD" python -m pilot.manage "$PILOT_ADMIN_EMAIL" admin
+          python -m uvicorn pilot.api:app --port 8000 > /tmp/pilot-api.log 2>&1 &
+          trap 'kill $! || true' EXIT
+          curl --retry 15 --retry-all-errors --retry-delay 1 -fsS http://127.0.0.1:8000/health/ready
+          python scripts/check-browser.py
+      - run: docker build -t pilot-check .
+  publish:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - run: docker build -t "${{ steps.image.outputs.name }}:$GITHUB_SHA" demo
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.image.outputs.name }}:${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push scanned image and record its immutable digest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          docker push "$IMAGE:$GITHUB_SHA"
+          REF=$(docker inspect "$IMAGE:$GITHUB_SHA" --format '{{index .RepoDigests 0}}')
+          jq -n --arg image "$REF" --arg sha "$GITHUB_SHA" '{image:$image,sha:$sha}' > image.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: releasepilot-image
+          path: image.json
